@@ -3,9 +3,10 @@ import {
   generateUUID,
   logInfo,
   logError,
+  logWarn,
   getWindowSelf,
+  getWinDimensions,
   getPerformanceNow,
-  isEmpty,
   isEmptyStr,
 } from '../src/utils.js';
 import { getGlobal } from '../src/prebidGlobal.js';
@@ -19,20 +20,10 @@ import { getViewportSize } from '../libraries/viewport/viewport.js';
 const GVLID = 1122;
 const ModuleCode = 'agma';
 const analyticsType = 'endpoint';
-const scriptVersion = '1.9.0';
+const scriptVersion = '1.10.0';
 const batchDelayInMs = 1000;
 const agmaURL = 'https://pbc.agma-analytics.de/v1';
 const pageViewId = generateUUID();
-
-// Helper functions
-const getScreen = () => {
-  try {
-    const { width: x, height: y } = getViewportSize();
-    return { x, y };
-  } catch (e) {
-    return { x: 0, y: 0 };
-  }
-};
 
 const getUserIDs = () => {
   try {
@@ -43,11 +34,11 @@ const getUserIDs = () => {
 
 export const getOrtb2Data = (options = {}) => {
   try {
-    const configData = config.getConfig();
+    const ortb2 = config.getAnyConfig('ortb2') || {};
     const win = getWindowSelf();
     return {
-      site: win.agma?.ortb2?.site ?? options.ortb2?.site ?? configData.ortb2?.site,
-      user: win.agma?.ortb2?.user ?? options.ortb2?.user ?? configData.ortb2?.user,
+      site: win.agma?.ortb2?.site ?? options.ortb2?.site ?? ortb2.site,
+      user: win.agma?.ortb2?.user ?? options.ortb2?.user ?? ortb2.user,
     };
   } catch (e) {
     return {};
@@ -55,25 +46,14 @@ export const getOrtb2Data = (options = {}) => {
 };
 
 export const getTiming = () => {
-  // Timing API V2
-  let ttfb;
+  const elapsedTime = getPerformanceNow();
+  let ttfb = 0;
   try {
     const entry = performance.getEntriesByType('navigation')[0];
     ttfb = Math.round(entry.responseStart - entry.startTime);
-  } catch (e) {
-    // Timing API V1
-    try {
-      const entry = performance.timing;
-      ttfb = Math.round(entry.responseStart - entry.fetchStart);
-    } catch (e) {
-      // Timing API not available
-      return null;
-    }
-  }
-  const elapsedTime = getPerformanceNow();
-  ttfb = ttfb >= 0 && ttfb <= elapsedTime ? ttfb : 0;
+  } catch (e) {}
   return {
-    ttfb,
+    ttfb: ttfb >= 0 && ttfb <= elapsedTime ? ttfb : 0,
     elapsedTime,
   };
 };
@@ -95,7 +75,6 @@ export const getPayload = (auctionIds, options) => {
 
   let payload = {
     auctionIds: auctionIds,
-    triggerEvent: options.triggerEvent,
     pageViewId,
     domain: ri.domain,
     gdprApplies,
@@ -104,13 +83,13 @@ export const getPayload = (auctionIds, options) => {
     pageUrl: ri.page,
     prebidVersion: '$prebid.version$',
     scriptVersion,
-    debug: options.debug,
     timing: getTiming(),
   };
 
   if (useExtendedPayload) {
     const device = config.getConfig('device') || {};
-    const { x, y } = getScreen();
+    const { width = 0, height = 0 } = getViewportSize();
+    const { screen } = getWinDimensions();
     const userIdsAsEids = getUserIDs();
     payload = {
       ...payload,
@@ -122,8 +101,8 @@ export const getPayload = (auctionIds, options) => {
       language: window.navigator.language,
       referrer: ri.topmostLocation,
       pageUrl: ri.page,
-      screenWidth: x,
-      screenHeight: y,
+      screenWidth: width,
+      screenHeight: height,
       deviceWidth: device.w || screen.width,
       deviceHeight: device.h || screen.height,
       userIdsAsEids,
@@ -134,27 +113,37 @@ export const getPayload = (auctionIds, options) => {
 
 const agmaAnalytics = Object.assign(adapter({ analyticsType }), {
   auctionIds: [],
+  started: new Set(),
   timer: null,
-  track(data) {
-    const { eventType, args } = data;
-    if (eventType === this.options.triggerEvent && args && args.auctionId) {
-      this.auctionIds.push(args.auctionId);
-      if (this.timer === null) {
-        this.timer = setTimeout(() => {
-          this.processBatch();
-        }, batchDelayInMs);
+  track({ eventType, args }) {
+    const auctionId = args?.auctionId;
+    if (!auctionId) {
+      return;
+    }
+    if (eventType === EVENTS.AUCTION_INIT) {
+      this.started.add(auctionId);
+      this.queueAuction(auctionId);
+    } else if (eventType === EVENTS.AUCTION_END) {
+      const alreadyCounted = this.started.delete(auctionId);
+      if (!alreadyCounted) {
+        this.queueAuction(auctionId);
       }
     }
   },
-  processBatch() {
-    const currentBatch = [...this.auctionIds];
-    const payload = getPayload(currentBatch, this.options);
-    this.auctionIds = [];
-    if (this.timer) {
-      clearTimeout(this.timer);
-      this.timer = null;
+  queueAuction(auctionId) {
+    this.auctionIds.push(auctionId);
+    if (this.timer === null) {
+      this.timer = setTimeout(() => {
+        this.processBatch();
+      }, batchDelayInMs);
     }
-    this.send(payload);
+  },
+  processBatch() {
+    const auctionIds = this.auctionIds;
+    this.auctionIds = [];
+    clearTimeout(this.timer);
+    this.timer = null;
+    this.send(getPayload(auctionIds, this.options));
   },
   send(payload) {
     if (!payload) {
@@ -169,36 +158,59 @@ const agmaAnalytics = Object.assign(adapter({ analyticsType }), {
       {
         contentType: 'text/plain',
         method: 'POST',
+        keepalive: true,
       }
     );
   },
 });
 
+const flushOnHide = (event) => {
+  if (event.type === 'pagehide' || document.visibilityState === 'hidden') {
+    agmaAnalytics.processBatch();
+  }
+};
+
 agmaAnalytics.originEnableAnalytics = agmaAnalytics.enableAnalytics;
 agmaAnalytics.enableAnalytics = function (config = {}) {
-  const { options } = config;
-
-  if (isEmpty(options)) {
-    logError(ModuleCode, 'Please set options');
-    return false;
-  }
+  const options = { ...config.options };
 
   if (options.site && !options.code) {
-    logError(ModuleCode, 'Please set `code` - `site` is deprecated');
+    logWarn(ModuleCode, 'options.site is deprecated, use options.code');
     options.code = options.site;
   }
 
   if (!options.code || isEmptyStr(options.code)) {
-    logError(ModuleCode, 'Please set `code` option - agma Analytics is disabled');
+    logError(ModuleCode, 'options.code missing, analytics disabled');
     return false;
   }
 
-  agmaAnalytics.options = {
-    triggerEvent: EVENTS.AUCTION_INIT,
-    ...options,
-  };
+  if (options.triggerEvent) {
+    logWarn(ModuleCode, 'options.triggerEvent is ignored');
+  }
+  if (options.sampling !== undefined) {
+    logWarn(ModuleCode, 'options.sampling is ignored');
+  }
+  agmaAnalytics.options = options;
 
-  agmaAnalytics.originEnableAnalytics(config);
+  agmaAnalytics.originEnableAnalytics({
+    ...config,
+    options: { ...options, sampling: 1 },
+    includeEvents: [EVENTS.AUCTION_INIT, EVENTS.AUCTION_END],
+    excludeEvents: [],
+  });
+  document.addEventListener('visibilitychange', flushOnHide);
+  window.addEventListener('pagehide', flushOnHide);
+};
+
+agmaAnalytics.originDisableAnalytics = agmaAnalytics.disableAnalytics;
+agmaAnalytics.disableAnalytics = function () {
+  document.removeEventListener('visibilitychange', flushOnHide);
+  window.removeEventListener('pagehide', flushOnHide);
+  clearTimeout(agmaAnalytics.timer);
+  agmaAnalytics.timer = null;
+  agmaAnalytics.auctionIds = [];
+  agmaAnalytics.started.clear();
+  agmaAnalytics.originDisableAnalytics();
 };
 
 adapterManager.registerAnalyticsAdapter({
